@@ -403,6 +403,84 @@ T5: Software reads ICC_IAR → returns 40
 - Verification angle: this is a critical race to cover in testbench
 
 ---
+📘 Key Idea
+The CPU exception entry is hardware‑driven and happens as soon as the IRQ signal is recognized and not masked.
+At that moment, the CPU hasn’t yet interacted with the GIC registers — it just reacts to the assertion of the IRQ line.
+
+The IAR read happens later, inside software, after the CPU has already saved state and jumped to the vector.
+
+🔹 Stage-by-Stage Timeline
+
+
+Initial:    PSTATE.I = 0   (IRQ unmasked)
+Time	Event	Hardware action
+T0	INTID 40 (prio 0x80) becomes pending	GIC asserts IRQ to core
+T1	CPU samples IRQ=1 → begins exception entry	
+• Saves PC → ELR_EL1	
+• Saves PSTATE → SPSR_EL1	
+• Updates PSTATE bits (I=1,F=1,A=1,D=1) → mask everything	
+• Loads PC ← IRQ vector address	
+T2	(Still finishing those micro‑ops) another interrupt arrives — INTID 41 with prio 0x10	GIC sees new higher priority pending; IRQ line already high
+(The core is already committed to enter the IRQ vector.)	
+T3	CPU starts executing vector code — handlers entry instructions	Software not yet read ICC_IAR1_EL1
+T4	Handler executes intid = MRS ICC_IAR1_EL1	GIC chooses the highest‑priority pending at this instant.
+INTID 41 has higher priority → GIC returns 41; marks it ACTIVE, leaves 40 pending.
+T5	Software handles INTID 41, writes EOI	GIC drops 41 → inactive, RPR updated, finds next pending (INTID 40) → re‑asserts IRQ
+T6	CPU, still in IRQ mode, sees IRQ line re‑asserted once PSTATE.I cleared → takes next interrupt, IAR returns 40.	
+🔹 Why This Works Even Though PSTATE.I=1 During Entry
+When the CPU starts exception entry, hardware sets PSTATE.I=1 to mask further IRQs until software deliberately unmasks.
+But that mask only affects further exception entries, not what ICC_IAR reads.
+At the moment you read IAR:
+
+The CPU is already inside the IRQ handler (so IRQ masking doesn’t block the IAR read).
+GIC’s logic decides, “Which pending interrupt should I hand to the CPU now?”
+It doesn’t “remember” which one first caused the entry.
+It simply returns whichever has the highest priority among current pending ones in the system.
+🔹 What Happens to State (SPSR/ELR)
+During exception entry:
+
+Register	Set by	Contains
+ELR_EL1	Hardware	Return address (instruction after the one interrupted)
+SPSR_EL1	Hardware	Copy of prior PSTATE (NZCV, SPSEL, DAIF, EL, etc.)
+PSTATE	Hardware updates	DAIF all set → exceptions masked; EL bits change to handler EL
+These happen before any instruction executes in software.
+Neither ELR_EL1 nor SPSR_EL1 depend on which interrupt will finally be reported by the IAR.
+They only describe the context you were in when the IRQ line was taken.
+
+🔹 The “Late Arrival” Summary in Human Words
+The CPU reacts to “IRQ line high” — not to a specific interrupt source.
+The GIC later tells it, at IAR read time, which interrupt currently deserves service.
+If a higher‑priority one sneaks in before the read, the GIC upgrades the answer.
+
+🔹 Mental Model Diagram
+markdown
+
+
+```text
+T0   T1         T2          T3             T4            T5
+│    │          │           │              │             │
+│ INT40 pend    │           │              │             │
+│ IRQ asserted  │           │              │             │
+│──────────────▶│ Exception │              │             │
+│               │ entry     │              │             │
+│               │ (save ELR,│              │             │
+│               │  SPSR)    │              │             │
+│               │           │ INT41 pend   │             │
+│               │           │ (higher prio)│             │
+│               │           │────────────▶ │             │
+│               │           │              │ IAR read →41│
+│               │           │              │             │
+│               │           │              │ EOI(41)     │
+│               │           │              │             │
+│               │           │              │ IRQ re‑assert│
+│               │           │              │ IAR read →40 │
+│               │           │              │             │
+```
+✅ So yes:
+
+Late arrivals can be reported instead of the original trigger.
+The CPU doesn’t need to re‑enable interrupts for that to happen; it will get the new INTID from the first IAR read.
+Once that higher‑priority interrupt finishes and is EOId, the earlier one (still pending) will be reported next.
 
 ## Topic 3: EOImode Behavior
 
